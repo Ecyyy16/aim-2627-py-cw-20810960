@@ -35,22 +35,117 @@ class Facing(Enum):
 # Q1 机器人自检（题面 Q1·自检状态计算与报告生成）
 # ---------------------------------------------------------------------------
 def hp_ratio(hp, max_hp):
-    """TODO(Q1)：血量百分比，返回 0-100 的 int；计算与边界规则见题面 Q1 规范。"""
-    raise NotImplementedError("Q1 hp_ratio：题面 Q1·血量百分比与精度保障")
+    """血量百分比，返回0-100的int"""
+    if max_hp <= 0:
+        if hp > 0:
+            return 100
+        else:
+            return 0
+    pct = int(round(hp * 100 / max_hp))
+    return max(0, min(100, pct))
 
 
 def status_report(name, robot_type, hp, max_hp, battery):
-    """TODO(Q1)：一行自检报告字符串；档位判定与逐字符格式见题面 Q1 规范。"""
-    raise NotImplementedError("Q1 status_report：题面 Q1·电量映射与报告格式")
+    """自检报告:假定 >=50 为 OK、 >=20 为 WARNING、其余为 LOW
+    """
+    pct = hp_ratio(hp, max_hp)
+    if battery >= 50:
+        tip = "OK"
+    elif battery >= 20:
+        tip = "WARNING"
+    else:
+        tip = "LOW"
+    return f"{name:<10}|{robot_type:^10}|HP {pct:>3}%|BAT {battery:>3}%|{tip}"
 
 
 # ---------------------------------------------------------------------------
 # Q2 战斗日志分析（题面 Q2·多源日志解析与统计）
 # ---------------------------------------------------------------------------
+_ARMOR_BY_CODE = {"F": "front", "L": "left", "R": "right"}
+
+
+def _parse_sensor_line(text):
+    """解析传感器行，返回 [(部位, 伤害), ...]；任一段非法则整行按脏行处理。"""
+    events = []
+    for seg in text.split(","):
+        parts = seg.strip().split(":")
+        # 分长度，字母，数字（整数正数检测）
+        if len(parts) != 2:
+            return None
+        armor = _ARMOR_BY_CODE.get(parts[0].strip())
+        if armor is None:
+            return None
+        try:
+            damage = int(parts[1].strip())
+        except ValueError:
+            return None
+        if damage <= 0:
+            return None
+        events.append((armor, damage))
+    return events
+
+
+def _parse_json_line(text, seen_ids):
+    """解析 JSON 行，返回 [(部位, 伤害), ...]；脏行或重复 id 返回 None。"""
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    armor = obj.get("armor")
+    if armor not in ("front", "left", "right"):
+        return None
+    damage = obj.get("damage")
+    if isinstance(damage, bool) or not isinstance(damage, int) or damage <= 0:
+        return None
+    if "id" in obj and obj["id"] is not None:
+        key = obj["id"]
+        try:
+            if key in seen_ids:
+                return None
+            seen_ids.add(key)
+        except TypeError:
+            return None
+    return [(armor, damage)]
+
+
 def analyze_damage_log(lines):
-    """TODO(Q2)：解析混合格式伤害日志，返回固定契约的统计 dict；
-    行格式、去重与统计口径见题面 Q2 规范。"""
-    raise NotImplementedError("Q2 analyze_damage_log：题面 Q2·多源日志解析与统计")
+    """解析混合格式伤害日志，
+       输出契约固定：total 为有效事件伤害总和；
+       by_armor 按三部位分桶累计，三个部位键在任何情况下恒存在，未受击为 0；
+       most_hit 为受击伤害最大的部位，无有效事件时为 None；
+       空日志0.0
+    """
+    total = 0
+    by_armor = {"front": 0, "left": 0, "right": 0}
+    event_count = 0
+    seen_ids = set()
+    for raw in lines:
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        try:
+            if text.startswith("{"):
+                parsed = _parse_json_line(text, seen_ids)
+            else:
+                parsed = _parse_sensor_line(text)
+        except Exception:
+            continue
+        if not parsed:
+            continue
+        for armor, damage in parsed:
+            total += damage
+            by_armor[armor] += damage
+            event_count += 1
+    return {
+        "total": total,
+        "by_armor": by_armor,
+        "most_hit": max(by_armor, key=by_armor.get) if event_count else None,
+        "avg": round(total / event_count, 2) if event_count else 0.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -139,26 +234,62 @@ class SentryGrid:
 
     @current_pos.setter
     def current_pos(self, value):
-        """TODO(Q3)：位置 setter；三重输入校验见题面 Q3 规范第 1 条。"""
-        raise NotImplementedError("Q3 current_pos.setter：题面 Q3·位置校验三步")
+        """
+        位置 setter：只接受长度为 2 的 tuple/list，否则 TypeError；
+        元素经规范化后以 tuple 存储
+        """
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            raise TypeError("current_pos 需要长度为 2 的 tuple/list")
+        self._pos = self._clamp_cell(value)
 
     def move_forward(self):
-        """TODO(Q3)：朝当前 facing 前进一格，返回执行后的位置；
-        碰撞、耗电与断电语义见题面 Q3 规范。"""
-        raise NotImplementedError("Q3 move_forward：题面 Q3·前进、碰撞与断电")
+        """
+        - 前方为障碍时，位置和朝向不变，collision_count 加 1。
+        - 前方可通行时，移动到该格。
+        - 前进消耗 1 单位电量。
+        - 电量 <= 0 时，前进尝试不再产生位移。
+        """
+        if self._fuel > 0:
+            self._fuel -= 1
+            nx = self._pos[0] + self._facing.delta[0]
+            ny = self._pos[1] + self._facing.delta[1]
+            if self.is_blocked(nx, ny):
+                self._collision_count += 1
+            else:
+                self._pos = (nx, ny)
+        return self._pos
 
     def turn_left(self):
-        """TODO(Q3)：原地左转 90°，返回新的 Facing（不耗电）。"""
-        raise NotImplementedError("Q3 turn_left")
+        """原地左转 90°，返回新的 Facing（不耗电）。"""
+
+        if self._facing is Facing.UP:
+            self._facing = Facing.LEFT
+        elif self._facing is Facing.LEFT:
+            self._facing = Facing.DOWN
+        elif self._facing is Facing.DOWN:
+            self._facing = Facing.RIGHT
+        else:
+            self._facing = Facing.UP
+        return self._facing
 
     def turn_right(self):
-        """TODO(Q3)：原地右转 90°，返回新的 Facing（不耗电）。"""
-        raise NotImplementedError("Q3 turn_right")
+        """原地右转 90°，返回新的 Facing（不耗电）。"""
 
+        if self._facing is Facing.UP:
+            self._facing = Facing.RIGHT
+        elif self._facing is Facing.RIGHT:
+            self._facing = Facing.DOWN
+        elif self._facing is Facing.DOWN:
+            self._facing = Facing.LEFT
+        else:  # self._facing is Facing.LEFT
+            self._facing = Facing.UP
+        return self._facing
 
 # ---------------------------------------------------------------------------
 # Q4 贪心导航（题面 Q4·单步贪心导航策略）
 # ---------------------------------------------------------------------------
+
+
 def next_step_toward(pos, target, obstacles, current_facing=Facing.UP):
     """TODO(Q4)：返回下一步应朝向的 Facing；
     候选判定、优先级与回退规则见题面 Q4 规范。"""
